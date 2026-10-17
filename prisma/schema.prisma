@@ -1,0 +1,143 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CLIENT
+  CLIPPER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  PENDING
+  SUSPENDED
+}
+
+enum CampaignStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED
+  ACTIVE
+  PAUSED
+  COMPLETED
+  REJECTED
+}
+
+enum ClipStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  UNDER_REVIEW
+  VERIFIED
+}
+
+enum PaymentType {
+  DEPOSIT
+  BALANCE
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  OVERDUE
+}
+
+enum Platform {
+  INSTAGRAM
+  TIKTOK
+  YOUTUBE
+  X
+}
+
+model User {
+  id               String      @id @default(uuid())
+  email            String      @unique
+  passwordHash     String
+  name             String
+  role             Role
+  companyName      String?
+  niche            String?
+  status           UserStatus  @default(PENDING)
+  isVerified       Boolean     @default(false)
+  earningsTotal    Decimal?    @default(0) @db.Decimal(12, 2)
+  campaignsCompleted Int       @default(0)
+  socialPages      SocialPage[]
+  campaigns        Campaign[]
+  clips            Clip[]
+  payments         Payment[]
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+}
+
+model SocialPage {
+  id            String   @id @default(uuid())
+  userId        String
+  platform      Platform
+  handle        String
+  followerCount Int      @default(0)
+  niche         String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Campaign {
+  id             String         @id @default(uuid())
+  clientId       String
+  title          String
+  brief          String
+  niche          String
+  videoUrl       String
+  cpmRate        Decimal        @db.Decimal(12, 2)
+  viewTarget     Int
+  budget         Decimal        @db.Decimal(12, 2)
+  platformFeePct Decimal        @db.Decimal(5, 2)
+  depositPaid    Decimal        @db.Decimal(12, 2)
+  balanceDue     Decimal        @db.Decimal(12, 2)
+  status         CampaignStatus @default(PENDING_REVIEW)
+  slotsLimit     Int            @default(5)
+  claimedSlots   Int            @default(0)
+  adminNotes     String?
+  approvedAt     DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  client         User           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  clips          Clip[]
+  payments       Payment[]
+}
+
+model Clip {
+  id                    String     @id @default(uuid())
+  campaignId            String
+  clipperId            String
+  pageHandle           String
+  platform             Platform
+  postUrl              String
+  postDate             DateTime
+  verificationWindowEnds DateTime
+  verifiedViews        Int        @default(0)
+  status               ClipStatus @default(PENDING)
+  payoutAmount         Decimal    @db.Decimal(12, 2)
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  campaign             Campaign   @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  clipper              User       @relation(fields: [clipperId], references: [id], onDelete: Cascade)
+}
+
+model Payment {
+  id        String        @id @default(uuid())
+  campaignId String
+  userId    String
+  type      PaymentType
+  amount    Decimal       @db.Decimal(12, 2)
+  status    PaymentStatus @default(PAID)
+  createdAt DateTime      @default(now())
+  campaign  Campaign      @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
