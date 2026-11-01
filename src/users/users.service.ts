@@ -1,4 +1,9 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { hashSync } from 'bcryptjs';
 import type { SocialPage, User, UserRole } from '../common/types.js';
 import { PrismaService } from '../prisma/prisma.service.js';
@@ -21,8 +26,81 @@ export class UsersService {
 
   async findByEmail(email: string): Promise<User | undefined> {
     const normalizedEmail = email.trim().toLowerCase();
-    const user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
+    const user = await this.prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
     return user ? this.toDomainUser(user) : undefined;
+  }
+
+  async createAuthToken(input: {
+    userId: string;
+    tokenHash: string;
+    type: 'EMAIL_VERIFICATION' | 'PASSWORD_RESET';
+    expiresAt: Date;
+  }) {
+    return this.prisma.authToken.create({ data: input });
+  }
+
+  async deleteAuthTokens(
+    userId: string,
+    type: 'EMAIL_VERIFICATION' | 'PASSWORD_RESET',
+  ) {
+    return this.prisma.authToken.deleteMany({ where: { userId, type } });
+  }
+
+  async findAuthToken(
+    tokenHash: string,
+    type: 'EMAIL_VERIFICATION' | 'PASSWORD_RESET',
+  ) {
+    return this.prisma.authToken
+      .findUnique({
+        where: { tokenHash },
+        select: {
+          id: true,
+          userId: true,
+          type: true,
+          expiresAt: true,
+          createdAt: true,
+        },
+      })
+      .then((token) => (token?.type === type ? token : null));
+  }
+
+  async verifyUserAndConsumeToken(
+    tokenId: string,
+    userId: string,
+  ): Promise<PublicUser> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.authToken.delete({ where: { id: tokenId } });
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: { isVerified: true, status: 'ACTIVE' },
+      });
+      return this.toPublicUser(updated);
+    });
+  }
+
+  async findByIdWithPassword(id: string): Promise<User | undefined> {
+    const user = await this.prisma.user.findUnique({ where: { id } });
+    return user ? this.toDomainUser(user) : undefined;
+  }
+
+  async updatePasswordAndConsumeToken(
+    userId: string,
+    tokenId: string,
+    passwordHash: string,
+  ): Promise<PublicUser> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.authToken.delete({ where: { id: tokenId } });
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: { passwordHash },
+      });
+      await tx.authToken.deleteMany({
+        where: { userId, type: 'PASSWORD_RESET' },
+      });
+      return this.toPublicUser(updated);
+    });
   }
 
   async findByRole(role: UserRole): Promise<PublicUser[]> {
@@ -43,24 +121,37 @@ export class UsersService {
     socialPages?: SocialPage[];
   }): Promise<PublicUser> {
     const normalizedEmail = input.email.trim().toLowerCase();
-    const existing = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
+    const existing = await this.prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
 
     if (existing) {
       throw new ConflictException('A user with this email already exists.');
     }
 
-    const createdUser = await this.prisma.user.create({
-      data: {
-        email: normalizedEmail,
-        passwordHash: hashSync(input.password, 10),
-        name: input.name,
-        role: this.toPrismaRole(input.role),
-        companyName: input.companyName ?? null,
-        niche: input.niche ?? null,
-        status: this.toPrismaStatus('pending'),
-        isVerified: input.role === 'admin',
-      },
-    });
+    let createdUser;
+    try {
+      createdUser = await this.prisma.user.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash: hashSync(input.password, 10),
+          name: input.name,
+          role: this.toPrismaRole(input.role),
+          companyName: input.companyName ?? null,
+          niche: input.niche ?? null,
+          status: this.toPrismaStatus('pending'),
+          isVerified: false,
+        },
+      });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new ConflictException('A user with this email already exists.');
+      }
+      throw error;
+    }
 
     return this.toPublicUser(createdUser);
   }
@@ -156,8 +247,11 @@ export class UsersService {
     return role.toUpperCase() as 'CLIENT' | 'CLIPPER' | 'ADMIN';
   }
 
-  private toPrismaStatus(status: User['status']): 'ACTIVE' | 'PENDING' | 'SUSPENDED' {
-    return (status ?? 'pending').toUpperCase() as 'ACTIVE' | 'PENDING' | 'SUSPENDED';
+  private toPrismaStatus(
+    status: User['status'],
+  ): 'ACTIVE' | 'PENDING' | 'SUSPENDED' {
+    return (status ?? 'pending').toUpperCase() as
+      'ACTIVE' | 'PENDING' | 'SUSPENDED';
   }
 
   private toAppRole(role: string): UserRole {
@@ -168,7 +262,9 @@ export class UsersService {
     return status.toLowerCase() as User['status'];
   }
 
-  private toNumber(value: number | { toNumber(): number } | null | undefined): number | undefined {
+  private toNumber(
+    value: number | { toNumber(): number } | null | undefined,
+  ): number | undefined {
     if (value === null || value === undefined) {
       return undefined;
     }

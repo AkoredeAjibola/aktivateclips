@@ -1,5 +1,17 @@
-import { Controller, Get, Param, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiParam, ApiTags } from '@nestjs/swagger';
+import {
+  Controller,
+  ForbiddenException,
+  Get,
+  Param,
+  UseGuards,
+} from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiOperation,
+  ApiParam,
+  ApiTags,
+} from '@nestjs/swagger';
+import { CurrentUser } from '../auth/current-user.decorator.js';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard.js';
 import { Roles } from '../auth/roles.decorator.js';
 import { RolesGuard } from '../auth/roles.guard.js';
@@ -28,14 +40,22 @@ export class UsersController {
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Fetch a single user by ID',
-    description: 'Returns a specific user record by UUID. Useful for loading client or clipper profiles into the frontend.',
+    description:
+      'Returns a specific user record by UUID. Useful for loading client or clipper profiles into the frontend.',
   })
   @ApiParam({
     name: 'id',
-    description: 'Unique user identifier (UUID) of the target client, clipper, or admin.',
+    description:
+      'Unique user identifier (UUID) of the target client, clipper, or admin.',
     type: String,
   })
-  findById(@Param('id') id: string) {
+  async findById(
+    @Param('id') id: string,
+    @CurrentUser() currentUser: { id: string; role: string },
+  ) {
+    if (currentUser.id !== id && currentUser.role !== 'admin') {
+      throw new ForbiddenException('You may only view your own profile.');
+    }
     return this.usersService.findById(id);
   }
 }

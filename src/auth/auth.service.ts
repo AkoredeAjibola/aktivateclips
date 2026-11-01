@@ -1,7 +1,15 @@
-import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common';
-import { compareSync, hashSync } from 'bcryptjs';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { compare, hash } from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { DEFAULT_JWT_SECRET } from '../common/constants.js';
 import { EmailService } from '../common/email.service.js';
 import type { User } from '../common/types.js';
@@ -20,30 +28,16 @@ export interface RegisterUserDto {
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
-  private readonly verificationTokens = new Map<string, { email: string; expiresAt: number }>();
-  private readonly passwordResetTokens = new Map<string, { email: string; expiresAt: number }>();
-
   constructor(
     private readonly usersService: UsersService,
     private readonly emailService: EmailService,
   ) {}
 
-  issueVerificationToken(email: string): string {
-    const token = randomBytes(32).toString('hex');
-    this.verificationTokens.set(token, {
-      email: email.toLowerCase(),
-      expiresAt: Date.now() + 60 * 60 * 1000,
-    });
-    return token;
+  private createRawToken() {
+    return randomBytes(32).toString('hex');
   }
-
-  issuePasswordResetToken(email: string): string {
-    const token = randomBytes(32).toString('hex');
-    this.passwordResetTokens.set(token, {
-      email: email.toLowerCase(),
-      expiresAt: Date.now() + 60 * 60 * 1000,
-    });
-    return token;
+  private hashToken(token: string) {
+    return createHash('sha256').update(token).digest('hex');
   }
 
   async register(registerUserDto: RegisterUserDto) {
@@ -53,9 +47,14 @@ export class AuthService {
       throw new ConflictException('A user with this email already exists.');
     }
 
-    const name = registerUserDto.name ?? registerUserDto.fullName;
+    const name = (registerUserDto.name ?? registerUserDto.fullName)?.trim();
     if (!name) {
-      throw new BadRequestException('Name is required. Please provide a valid name or fullName.');
+      throw new BadRequestException(
+        'Name is required. Please provide a valid name or fullName.',
+      );
+    }
+    if (!['client', 'clipper'].includes(registerUserDto.role)) {
+      throw new BadRequestException('Role must be client or clipper.');
     }
 
     const createdUser = await this.usersService.create({
@@ -67,19 +66,33 @@ export class AuthService {
       niche: registerUserDto.niche,
     });
 
-    const verificationToken = this.issueVerificationToken(createdUser.email);
+    const verificationToken = this.createRawToken();
+    await this.usersService.createAuthToken({
+      userId: createdUser.id,
+      tokenHash: this.hashToken(verificationToken),
+      type: 'EMAIL_VERIFICATION',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
 
     try {
-      await this.emailService.sendVerificationEmail(createdUser.email, verificationToken);
+      await this.emailService.sendVerificationEmail(
+        createdUser.email,
+        verificationToken,
+      );
     } catch (error) {
-      this.logger.warn(`Verification email could not be sent to ${createdUser.email}: ${(error as Error).message}`);
+      this.logger.error(
+        `Verification email could not be sent to ${createdUser.email}: ${(error as Error).message}`,
+      );
+      throw new ServiceUnavailableException(
+        'Your account was created, but the verification email could not be sent. Please request a new verification email.',
+      );
     }
 
     return {
       user: { ...createdUser, isVerified: false },
-      verificationToken,
       requiresEmailVerification: true,
-      message: 'Registration successful. Please verify your email address to activate your account.',
+      message:
+        'Registration successful. Please verify your email address to activate your account.',
     };
   }
 
@@ -96,39 +109,46 @@ export class AuthService {
       };
     }
 
-    const verificationToken = this.issueVerificationToken(email);
+    const verificationToken = this.createRawToken();
+    await this.usersService.deleteAuthTokens(user.id, 'EMAIL_VERIFICATION');
+    await this.usersService.createAuthToken({
+      userId: user.id,
+      tokenHash: this.hashToken(verificationToken),
+      type: 'EMAIL_VERIFICATION',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
 
     try {
       await this.emailService.sendVerificationEmail(email, verificationToken);
     } catch (error) {
-      this.logger.warn(`Verification email resend failed for ${email}: ${(error as Error).message}`);
+      this.logger.error(
+        `Verification email resend failed for ${email}: ${(error as Error).message}`,
+      );
+      throw new ServiceUnavailableException(
+        'The verification email could not be sent. Please try again later.',
+      );
     }
 
     return {
       success: true,
       message: 'A new verification email has been sent.',
-      verificationToken,
     };
   }
 
   async verifyEmail(token: string) {
-    const record = this.verificationTokens.get(token);
-    if (!record || record.expiresAt < Date.now()) {
-      throw new BadRequestException('Verification token is invalid or expired.');
+    const record = await this.usersService.findAuthToken(
+      this.hashToken(token),
+      'EMAIL_VERIFICATION',
+    );
+    if (!record || record.expiresAt.getTime() < Date.now()) {
+      throw new BadRequestException(
+        'Verification token is invalid or expired.',
+      );
     }
-
-    const user = await this.usersService.findByEmail(record.email);
-    if (!user) {
-      throw new NotFoundException('User associated with this token was not found.');
-    }
-
-    const updatedUser = this.usersService.updateUser(user.id, {
-      isVerified: true,
-      status: 'active',
-      updatedAt: new Date().toISOString(),
-    });
-
-    this.verificationTokens.delete(token);
+    const updatedUser = await this.usersService.verifyUserAndConsumeToken(
+      record.id,
+      record.userId,
+    );
 
     return {
       success: true,
@@ -142,46 +162,64 @@ export class AuthService {
     if (!user) {
       return {
         success: true,
-        message: 'If an account exists for this email, a password reset link has been sent.',
+        message:
+          'If an account exists for this email, a password reset link has been sent.',
       };
     }
 
-    const resetToken = this.issuePasswordResetToken(email);
+    const resetToken = this.createRawToken();
+    await this.usersService.deleteAuthTokens(user.id, 'PASSWORD_RESET');
+    await this.usersService.createAuthToken({
+      userId: user.id,
+      tokenHash: this.hashToken(resetToken),
+      type: 'PASSWORD_RESET',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
 
     try {
       await this.emailService.sendPasswordResetEmail(email, resetToken);
     } catch (error) {
-      this.logger.warn(`Password reset email could not be sent to ${email}: ${(error as Error).message}`);
+      this.logger.error(
+        `Password reset email could not be sent to ${email}: ${(error as Error).message}`,
+      );
+      throw new ServiceUnavailableException(
+        'The password reset email could not be sent. Please try again later.',
+      );
     }
 
     return {
       success: true,
       message: 'Password reset instructions have been sent to your email.',
-      resetToken,
     };
   }
 
   async resetPassword(token: string, newPassword: string) {
-    const record = this.passwordResetTokens.get(token);
-    if (!record || record.expiresAt < Date.now()) {
+    const record = await this.usersService.findAuthToken(
+      this.hashToken(token),
+      'PASSWORD_RESET',
+    );
+    if (!record || record.expiresAt.getTime() < Date.now()) {
       throw new BadRequestException('Reset token is invalid or expired.');
     }
 
     if (!newPassword || newPassword.length < 8) {
-      throw new BadRequestException('Password must be at least 8 characters long.');
+      throw new BadRequestException(
+        'Password must be at least 8 characters long.',
+      );
     }
 
-    const user = await this.usersService.findByEmail(record.email);
+    const user = await this.usersService.findByIdWithPassword(record.userId);
     if (!user) {
-      throw new NotFoundException('User associated with this password reset token was not found.');
+      throw new NotFoundException(
+        'User associated with this password reset token was not found.',
+      );
     }
 
-    const updatedUser = this.usersService.updateUser(user.id, {
-      passwordHash: hashSync(newPassword, 10),
-      updatedAt: new Date().toISOString(),
-    });
-
-    this.passwordResetTokens.delete(token);
+    const updatedUser = await this.usersService.updatePasswordAndConsumeToken(
+      user.id,
+      record.id,
+      await hash(newPassword, 10),
+    );
 
     return {
       success: true,
@@ -196,11 +234,16 @@ export class AuthService {
       return null;
     }
 
-    const isPasswordValid = compareSync(password, user.passwordHash);
+    const isPasswordValid = await compare(password, user.passwordHash);
     if (!isPasswordValid) {
       return null;
     }
 
+    if (!user.isVerified || user.status !== 'active') {
+      throw new UnauthorizedException(
+        'Please verify your email address before signing in.',
+      );
+    }
     return user;
   }
 
@@ -223,8 +266,12 @@ export class AuthService {
   }
 
   generateToken(user: Pick<User, 'id' | 'email' | 'role'>): string {
-    return jwt.sign({ sub: user.id, email: user.email, role: user.role }, DEFAULT_JWT_SECRET, {
-      expiresIn: '7d',
-    });
+    return jwt.sign(
+      { sub: user.id, email: user.email, role: user.role },
+      DEFAULT_JWT_SECRET,
+      {
+        expiresIn: '7d',
+      },
+    );
   }
 }
